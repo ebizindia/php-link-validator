@@ -1,0 +1,51 @@
+{
+    "name": "ebizindia/php-link-validator",
+    "description": "A powerful, optimized PHP link validator with multi-cURL processing and memory optimization",
+    "type": "project",
+    "keywords": [
+        "broken-links",
+        "link-checker",
+        "seo",
+        "website-crawler",
+        "php",
+        "multi-curl",
+        "performance"
+    ],
+    "homepage": "https://github.com/yourusername/php-link-validator",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Ebizindia Team",
+            "email": "ebizindia@gmail.com",
+            "homepage": "https://www.ebizindia.com",
+            "role": "Developer"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/yourusername/php-link-validator/issues",
+        "source": "https://github.com/yourusername/php-link-validator"
+    },
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-dom": "*",
+        "ext-libxml": "*"
+    },
+    "suggest": {
+        "ext-mbstring": "For better string handling",
+        "ext-json": "For JSON export functionality (future feature)"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "echo 'No tests configured yet'",
+        "check-syntax": "find . -name '*.php' -exec php -l {} \\;"
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "2.0.x-dev"
+        }
+    }
+}
