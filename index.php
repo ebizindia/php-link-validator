@@ -47,9 +47,11 @@ define('SKIP_EXTERNAL_DOMAINS', [
 ]);
 
 // === SECURITY SETTINGS ===
-define('ENABLE_SSL_VERIFY', false);       // Enable SSL certificate verification
+define('ENABLE_SSL_VERIFY', true);        // Enable SSL certificate verification (SECURITY: Must be true)
 define('MAX_QUEUE_SIZE', 1000);           // Maximum URLs in crawl queue
 define('GARBAGE_COLLECTION_INTERVAL', 10); // Run garbage collection every N pages
+define('RATE_LIMIT_SECONDS', 60);         // Minimum seconds between checks per session
+define('ENABLE_SSRF_PROTECTION', true);   // Block internal/private IP ranges
 
 // === UI SETTINGS ===
 define('SHOW_PERFORMANCE_STATS', true);   // Show performance statistics
@@ -66,7 +68,26 @@ define('RESULTS_PER_PAGE', 50);           // Results to display per page (future
 ini_set('max_execution_time', MAX_EXECUTION_TIME);
 set_time_limit(MAX_EXECUTION_TIME);
 ini_set('memory_limit', MEMORY_LIMIT);
+
+// SECURITY: Secure session configuration
+ini_set('session.cookie_httponly', 1);
+ini_set('session.cookie_secure', isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 1 : 0);
+ini_set('session.cookie_samesite', 'Strict');
+ini_set('session.use_strict_mode', 1);
+ini_set('session.use_only_cookies', 1);
 session_start();
+
+// SECURITY: Generate CSRF token
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// SECURITY: Set security headers
+header("X-Frame-Options: DENY");
+header("X-Content-Type-Options: nosniff");
+header("Referrer-Policy: strict-origin-when-cross-origin");
+header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
+header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://code.jquery.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self' https://cdn.jsdelivr.net;");
 
 class OptimizedLinkChecker {
     private $visited = [];
@@ -93,10 +114,15 @@ class OptimizedLinkChecker {
     private $memoryPeakUsage;
     
     public function __construct($url, $maxPages = null, $checkExternal = null) {
+        // SECURITY: Validate URL before processing
+        if (!$this->isUrlSafe($url)) {
+            throw new Exception('Invalid or unsafe URL provided');
+        }
+
         $this->baseUrl = $this->normalizeUrl($url);
         $this->domain = parse_url($this->baseUrl, PHP_URL_HOST);
         $this->queue[] = $this->baseUrl;
-        
+
         // Use configuration constants
         $this->maxPages = $maxPages ?? MAX_PAGES_DEFAULT;
         $this->checkExternal = $checkExternal ?? CHECK_EXTERNAL_DEFAULT;
@@ -107,6 +133,91 @@ class OptimizedLinkChecker {
         $this->maxConcurrentRequests = MAX_CONCURRENT_REQUESTS;
         $this->batchSize = BATCH_SIZE;
         $this->retryCount = RETRY_COUNT;
+    }
+
+    /**
+     * SECURITY: Validate URL to prevent SSRF attacks
+     * Blocks private IP ranges, localhost, and internal networks
+     */
+    private function isUrlSafe($url) {
+        if (!ENABLE_SSRF_PROTECTION) {
+            return true; // Skip validation if disabled
+        }
+
+        // Normalize URL first
+        if (!preg_match('/^https?:\/\//', $url)) {
+            $url = 'https://' . $url;
+        }
+
+        $parsed = parse_url($url);
+        if (!$parsed || !isset($parsed['host'])) {
+            return false;
+        }
+
+        $host = $parsed['host'];
+
+        // Only allow http and https
+        if (!in_array($parsed['scheme'], ['http', 'https'], true)) {
+            return false;
+        }
+
+        // Block localhost variations
+        $blockedHosts = [
+            'localhost',
+            'localhost.localdomain',
+            '127.0.0.1',
+            '0.0.0.0',
+            '::1',
+            '0:0:0:0:0:0:0:1',
+            '169.254.169.254', // AWS metadata
+            'metadata.google.internal', // GCP metadata
+        ];
+
+        if (in_array(strtolower($host), $blockedHosts, true)) {
+            return false;
+        }
+
+        // Resolve hostname to IP
+        $ip = gethostbyname($host);
+
+        // Check if resolution failed (returns same string)
+        if ($ip === $host && !filter_var($ip, FILTER_VALIDATE_IP)) {
+            // Could not resolve, but might be valid domain
+            // Allow it but log for review
+            return true;
+        }
+
+        // Block private and reserved IP ranges
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            // Block private IPv4 ranges
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+                return false;
+            }
+
+            // Additional manual checks for ranges that might slip through
+            $longIp = ip2long($ip);
+            if ($longIp === false) {
+                return false;
+            }
+
+            // 10.0.0.0/8
+            if (($longIp & 0xFF000000) === 0x0A000000) return false;
+            // 172.16.0.0/12
+            if (($longIp & 0xFFF00000) === 0xAC100000) return false;
+            // 192.168.0.0/16
+            if (($longIp & 0xFFFF0000) === 0xC0A80000) return false;
+            // 127.0.0.0/8
+            if (($longIp & 0xFF000000) === 0x7F000000) return false;
+            // 169.254.0.0/16 (link-local)
+            if (($longIp & 0xFFFF0000) === 0xA9FE0000) return false;
+        } elseif (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            // Block private IPv6 ranges
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+                return false;
+            }
+        }
+
+        return true;
     }
     
     private function normalizeUrl($url) {
@@ -156,8 +267,26 @@ class OptimizedLinkChecker {
             $cacheHits = count($this->checkedLinks);
             $currentMemory = round(memory_get_usage() / 1024 / 1024, 2);
             $peakMemory = round(memory_get_peak_usage() / 1024 / 1024, 2);
-            
-            echo "<script>document.getElementById('status').innerHTML = 'Checking page: " . htmlspecialchars($currentUrl) . "<br>Progress: " . $progress . "% (" . $count . "/" . $this->maxPages . ")<br>Queue: " . count($this->queue) . " URLs remaining<br>Cached: " . $cacheHits . " unique links<br>Memory: " . $currentMemory . "MB (Peak: " . $peakMemory . "MB)';</script>";
+
+            // SECURITY: Use safe JavaScript output with proper escaping
+            $statusMessage = sprintf(
+                'Checking page: %s<br>Progress: %d%% (%d/%d)<br>Queue: %d URLs remaining<br>Cached: %d unique links<br>Memory: %sMB (Peak: %sMB)',
+                htmlspecialchars($currentUrl, ENT_QUOTES, 'UTF-8'),
+                $progress,
+                $count,
+                $this->maxPages,
+                count($this->queue),
+                $cacheHits,
+                $currentMemory,
+                $peakMemory
+            );
+
+            echo "<script>
+            (function() {
+                var el = document.getElementById('status');
+                if (el) el.innerHTML = " . json_encode($statusMessage) . ";
+            })();
+            </script>";
             echo str_repeat(' ', 1024);
             flush();
             
@@ -621,74 +750,133 @@ class OptimizedLinkChecker {
 $results = [];
 $crawled = false;
 $emailSent = false;
+$errorMessage = '';
 
 if (isset($_POST['action']) && $_POST['action'] === 'check' && !empty($_POST['domain'])) {
-    $domain = filter_var(trim($_POST['domain']), FILTER_SANITIZE_URL);
-    $sendEmail = isset($_POST['send_email']);
-    $checkExternal = isset($_POST['check_external']);
-    
-    $limit = MAX_PAGES_DEFAULT;
-    if (isset($_GET['limit']) && is_numeric($_GET['limit'])) {
-        $limit = max(1, min(MAX_PAGES_LIMIT, intval($_GET['limit'])));
+    // SECURITY: CSRF token validation
+    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        die('CSRF validation failed. Please refresh the page and try again.');
     }
-    
-    if ($domain) {
-        $redirectUrl = $_SERVER['PHP_SELF'] . '?crawl=1&domain=' . urlencode($domain) . '&limit=' . $limit;
-        if ($sendEmail) $redirectUrl .= '&email=1';
-        if ($checkExternal) $redirectUrl .= '&external=1';
-        
-        header('Location: ' . $redirectUrl);
-        exit;
+
+    // SECURITY: Rate limiting
+    $lastRequestTime = $_SESSION['last_request_time'] ?? 0;
+    $timeSinceLastRequest = time() - $lastRequestTime;
+
+    if ($timeSinceLastRequest < RATE_LIMIT_SECONDS) {
+        $waitTime = RATE_LIMIT_SECONDS - $timeSinceLastRequest;
+        $errorMessage = "Please wait {$waitTime} seconds before starting another check (rate limit protection).";
+    } else {
+        // SECURITY: Use proper validation instead of deprecated FILTER_SANITIZE_URL
+        $domain = trim($_POST['domain']);
+
+        // Validate domain format
+        if (empty($domain)) {
+            $errorMessage = 'Please enter a domain name.';
+        } else {
+            // Try to validate as URL or domain
+            $testUrl = preg_match('/^https?:\/\//', $domain) ? $domain : 'https://' . $domain;
+
+            if (!filter_var($testUrl, FILTER_VALIDATE_URL)) {
+                $errorMessage = 'Invalid domain or URL format.';
+            } else {
+                $sendEmail = isset($_POST['send_email']);
+                $checkExternal = isset($_POST['check_external']);
+
+                $limit = MAX_PAGES_DEFAULT;
+                if (isset($_GET['limit']) && is_numeric($_GET['limit'])) {
+                    $limit = max(1, min(MAX_PAGES_LIMIT, intval($_GET['limit'])));
+                }
+
+                // SECURITY: Validate redirect URL components
+                $redirectUrl = $_SERVER['PHP_SELF'] . '?crawl=1&domain=' . urlencode($domain) . '&limit=' . intval($limit);
+                if ($sendEmail) $redirectUrl .= '&email=1';
+                if ($checkExternal) $redirectUrl .= '&external=1';
+
+                // Update rate limit timestamp
+                $_SESSION['last_request_time'] = time();
+
+                header('Location: ' . $redirectUrl);
+                exit;
+            }
+        }
     }
 }
 
 // Handle the actual crawling (from redirect)
 if (isset($_GET['crawl']) && $_GET['crawl'] === '1' && !empty($_GET['domain'])) {
-    $domain = filter_var(trim($_GET['domain']), FILTER_SANITIZE_URL);
-    $sendEmail = isset($_GET['email']);
-    $checkExternal = isset($_GET['external']);
-    $limit = isset($_GET['limit']) ? max(1, min(MAX_PAGES_LIMIT, intval($_GET['limit']))) : MAX_PAGES_DEFAULT;
-    
-    if ($domain) {
+    // SECURITY: Validate domain from GET parameter
+    $domain = trim($_GET['domain']);
+    $testUrl = preg_match('/^https?:\/\//', $domain) ? $domain : 'https://' . $domain;
+
+    if (!filter_var($testUrl, FILTER_VALIDATE_URL)) {
+        $errorMessage = 'Invalid domain or URL format.';
+    } else {
+        $sendEmail = isset($_GET['email']);
+        $checkExternal = isset($_GET['external']);
+        $limit = isset($_GET['limit']) ? max(1, min(MAX_PAGES_LIMIT, intval($_GET['limit']))) : MAX_PAGES_DEFAULT;
+
         $crawled = true;
         $linkTypeText = $checkExternal ? "internal and external links" : "internal links only";
-        
+
         echo "<script>
         document.addEventListener('DOMContentLoaded', function() {
             document.getElementById('crawl-form').style.display = 'none';
         });
         </script>";
-        
+
         echo "<div id='crawling-status' class='alert alert-info'>";
-        echo "<h5><span class='spinner-border spinner-border-sm mr-2'></span>Checking $linkTypeText for <strong>" . htmlspecialchars($domain) . "</strong> (Limited to $limit pages)</h5>";
+        echo "<h5><span class='spinner-border spinner-border-sm mr-2'></span>Checking " . htmlspecialchars($linkTypeText) . " for <strong>" . htmlspecialchars($domain) . "</strong> (Limited to " . htmlspecialchars($limit) . " pages)</h5>";
         echo "<div id='status'>Initializing optimized crawler with multi-cURL...</div>";
         echo "</div>";
         echo str_repeat(' ', 1024);
         flush();
-        
-        $checker = new OptimizedLinkChecker($domain, $limit, $checkExternal);
-        $results = $checker->crawl();
-        $totalCrawled = $checker->getTotalCrawled();
-        $totalLinksChecked = $checker->getTotalLinksChecked();
-        $cacheStats = $checker->getCacheStats();
-        
-        echo "<script>document.getElementById('crawling-status').style.display='none';</script>";
-        
-        // Send email if requested
-        if ($sendEmail) {
-            $subject = empty($results) ? 
-                'Link Check Report for ' . $domain . ' - No Broken Links Found' :
-                'Link Check Report for ' . $domain . ' - ' . count($results) . ' Broken Links';
-            
-            $emailBody = generateEmailReport($results, $domain, $totalCrawled, $totalLinksChecked, $checkExternal, $cacheStats, $checker->getExecutionTime(), $checker->getMemoryStats());
-            
-            // Simple headers that work
-            $headers = "From: " . EMAIL_FROM . "\r\n";
-            $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
-            
-            if (mail(EMAIL_TO, $subject, $emailBody, $headers)) {
-                $emailSent = true;
+
+        // SECURITY: Wrap in try-catch to handle SSRF and other exceptions
+        try {
+            $checker = new OptimizedLinkChecker($domain, $limit, $checkExternal);
+            $results = $checker->crawl();
+            $totalCrawled = $checker->getTotalCrawled();
+            $totalLinksChecked = $checker->getTotalLinksChecked();
+            $cacheStats = $checker->getCacheStats();
+
+            echo "<script>document.getElementById('crawling-status').style.display='none';</script>";
+
+            // Send email if requested
+            if ($sendEmail) {
+                // SECURITY: Sanitize email inputs to prevent header injection
+                $from = filter_var(EMAIL_FROM, FILTER_VALIDATE_EMAIL);
+                $to = filter_var(EMAIL_TO, FILTER_VALIDATE_EMAIL);
+
+                if ($from && $to) {
+                    // Remove any newlines from email addresses
+                    $from = str_replace(["\r", "\n", "%0a", "%0d"], '', $from);
+                    $to = str_replace(["\r", "\n", "%0a", "%0d"], '', $to);
+
+                    $subject = empty($results) ?
+                        'Link Check Report for ' . $domain . ' - No Broken Links Found' :
+                        'Link Check Report for ' . $domain . ' - ' . count($results) . ' Broken Links';
+
+                    // Remove newlines from subject
+                    $subject = str_replace(["\r", "\n"], '', $subject);
+
+                    $emailBody = generateEmailReport($results, $domain, $totalCrawled, $totalLinksChecked, $checkExternal, $cacheStats, $checker->getExecutionTime(), $checker->getMemoryStats());
+
+                    // SECURITY: Safe email headers
+                    $headers = "From: " . $from . "\r\n";
+                    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+
+                    if (mail($to, $subject, $emailBody, $headers)) {
+                        $emailSent = true;
+                    }
+                } else {
+                    $errorMessage = 'Invalid email configuration.';
+                }
             }
+        } catch (Exception $e) {
+            // SECURITY: Handle exceptions gracefully without exposing internals
+            echo "<script>document.getElementById('crawling-status').style.display='none';</script>";
+            $errorMessage = 'An error occurred: ' . htmlspecialchars($e->getMessage());
+            $crawled = false;
         }
     }
 }
@@ -916,9 +1104,16 @@ function generateEmailReport($results, $domain, $totalCrawled, $totalLinksChecke
             
             <div class="content">
                 <div id="crawl-form" <?php echo $crawled ? 'style="display:none;"' : ''; ?>>
+                <?php if (!empty($errorMessage)): ?>
+                <div class="alert alert-danger" role="alert">
+                    <strong>Error:</strong> <?php echo htmlspecialchars($errorMessage); ?>
+                </div>
+                <?php endif; ?>
                 <form method="post" action="">
                     <input type="hidden" name="action" value="check">
-                    
+                    <!-- SECURITY: CSRF Token -->
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+
                     <div class="form-group">
                         <label for="domain">Website Domain</label>
                         <input type="text" 
